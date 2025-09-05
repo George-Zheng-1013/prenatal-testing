@@ -10,6 +10,7 @@ import seaborn as sns
 from lifelines import KaplanMeierFitter
 from lifelines.utils import datetimes_to_durations
 import statsmodels.api as sm
+from lifelines.statistics import logrank_test  # 新增导入
 
 try:
     # 部分类型检查器可能无法识别 patsy 顶层导出，添加忽略标注
@@ -17,20 +18,21 @@ try:
 except Exception:  # pragma: no cover
     from patsy.highlevel import dmatrix  # 备用导入
 
-# 移除自定义字体设置，使用默认字体
-# -----------------------------
-# Config
-# -----------------------------
 THRESHOLD = 0.04  # Y染色体浓度达标阈值
 BOOT_N = 100  # bootstrap 次数
 RANDOM_STATE = 42
-
+TARGET = 0.95  # 全局目标达标率
 # 孕周窗口与偏好（越早越好）
 EARLY_END = 12.0
 MID_END = 27.0
 LATE_START = 28.0
-# 在早孕窗口内允许的较低阈值（若严格95%无法达成，则给出90%备选建议）
-EARLY_ALT_TARGET = 0.90
+
+# 在常量区新增一个开关
+GROUPING_METHOD = "supervised"  # 可选: "quantile"(现有逻辑), "clinical", "supervised"
+MIN_GROUP_SIZE = 30  # 监督式分组每个子组的最小样本量
+MAX_GROUPS = 6  # 监督式分组最多分组数
+# 新增：分段阶段的目标达标率（比最终报告略低，提升可分性）
+SEG_TARGET = 0.90
 
 
 @dataclass
@@ -78,7 +80,6 @@ def preprocess_data(
     # 标注达标
     df["达标"] = df["Y染色体浓度"] >= threshold
 
-    # 所有样本均视为男胎，不做筛选
     df_male = df.copy()
 
     # 个体层：首次达标孕周 / 若未达标则以最后一次孕周作为删失时间
@@ -94,7 +95,6 @@ def preprocess_data(
         bmi = float(g["孕妇BMI"].iloc[0])
         return pd.Series({"duration_week": t, "event": event, "孕妇BMI": bmi})
 
-    # 为避免 pandas 对未来行为的告警，这里在 apply 前显式选择需要的列
     df_subjects = (
         df_male.groupby("孕妇代码", as_index=False)[["检测孕周", "达标", "孕妇BMI"]]
         .apply(_first_hit_or_censor)
@@ -145,7 +145,7 @@ def group_bmi(
 
 
 def km_estimate_t_star(
-    durations: np.ndarray, events: np.ndarray, target: float = 0.95
+    durations: np.ndarray, events: np.ndarray, target: float = TARGET
 ) -> Tuple[Optional[float], Optional[float]]:
     """根据KM估计累计达标率F(t)=1-S(t)，返回最早 t* 使 F(t)≥target 以及 F(t*)。
     若未达到target，返回达到的最大F与对应t（按事件时间节点）。
@@ -178,9 +178,7 @@ def bootstrap_t_star(
     durations: np.ndarray,
     events: np.ndarray,
     n_boot: int = BOOT_N,
-    target: float = 0.95,
-    random_state: int = RANDOM_STATE,
-) -> Tuple[Optional[float], Optional[float]]:
+    target: float
     """对个体层数据进行bootstrap，返回 t* 的 95% CI（2.5%, 97.5%）。
     若大多数样本未达到 target，可能返回 (None, None)。
     """
@@ -275,8 +273,8 @@ def analyze_group(
     events = df_subj_group["event"].values.astype(bool)
 
     # KM估计与 t*
-    t_star, F_at_t = km_estimate_t_star(durations, events, target=0.95)
-    ci_low, ci_high = bootstrap_t_star(durations, events, n_boot=BOOT_N, target=0.95)
+    t_star, F_at_t = km_estimate_t_star(durations, events, target=TARGET)
+    ci_low, ci_high = bootstrap_t_star(durations, events, n_boot=BOOT_N, target=TARGET)
 
     # 删失比例
     n = len(df_subj_group)
@@ -322,9 +320,6 @@ def analyze_group(
             if (sf.index <= LATE_START).any()
             else float(sf["F"].iloc[-1])
         )
-
-    # 早孕窗口内的90%备选 t（若有）
-    early_alt_t = earliest_t_within_window(sf, target=EARLY_ALT_TARGET, t_max=EARLY_END)
 
     # t* 所属窗口
     t_star_window = classify_window(t_star)
@@ -417,15 +412,181 @@ def analyze_group(
         F_at_12w=float(F_at_12w) if F_at_12w is not None else None,
         F_at_13w=float(F_at_13w) if F_at_13w is not None else None,
         F_at_28w=float(F_at_28w) if F_at_28w is not None else None,
-        early_alt_t90=float(early_alt_t) if early_alt_t is not None else None,
+        early_alt_t90=None,  # 早孕窗口内的备选（已移除，不再计算）
     )
+
+
+def group_bmi_clinical(df_subjects: pd.DataFrame) -> Tuple[pd.DataFrame, List[float]]:
+    """按照题目给定的分组"""
+    bins = [20, 28, 32, 36, 40, np.inf]
+    labels = ["20–28", "28–32", "32–36", "36–40", ">=40"]
+    cat = pd.cut(
+        df_subjects["孕妇BMI"].astype(float), bins=bins, labels=labels, right=False
+    )
+    df = df_subjects.copy()
+    df["bmi_group"] = cat.cat.codes + 1
+    df["bmi_group_label"] = [f"CN {l}" for l in cat.astype(str)]
+    # 返回边界列表
+    boundaries = [20.0, 28.0, 32.0, 36.0, 40.0, float(1e9)]
+    return df, boundaries
+
+
+def _segment_score(
+    durations: np.ndarray, events: np.ndarray, target: float = TARGET
+) -> Tuple[float, float]:
+    """返回(组内t*, F(12w))，用于评估切分收益。"""
+    t_star, F_at = km_estimate_t_star(durations, events, target=target)
+    kmf = KaplanMeierFitter().fit(durations, events)
+    try:
+        F12 = float(1 - kmf.survival_function_at_times([EARLY_END]).iloc[0])
+    except Exception:
+        sf = kmf.survival_function_.copy()
+        sf["F"] = 1 - sf.iloc[:, 0]
+        F12 = (
+            float(sf["F"].loc[sf.index[sf.index <= EARLY_END]].iloc[-1])
+            if (sf.index <= EARLY_END).any()
+            else float(sf["F"].iloc[0])
+        )
+    return (float(t_star) if t_star is not None else np.inf, F12)
+
+
+def group_bmi_supervised(
+    df_subjects: pd.DataFrame,
+    max_groups: int = MAX_GROUPS,
+    min_size: int = MIN_GROUP_SIZE,
+    target: float = TARGET,
+) -> Tuple[pd.DataFrame, List[float]]:
+    """
+    监督式分组（生存树思想）：
+    - 在 BMI 上寻找切分点，使加权平均 t* 尽可能小（并兼顾提高 F(12w)）。
+    - 迭代二分直到达到 max_groups 或无显著提升。
+    """
+    df = df_subjects.copy()
+    df = df.sort_values("孕妇BMI").reset_index(drop=True)
+    segments = [(0, len(df))]  # 用索引区间表示段
+    # 预先准备数据
+    bmi = df["孕妇BMI"].to_numpy(float)
+    dur = df["duration_week"].to_numpy(float)
+    evt = df["event"].to_numpy(bool)
+
+    def segment_indices(seg):  # 返回该段内的布尔掩码
+        i, j = seg
+        mask = np.zeros(len(df), dtype=bool)
+        mask[i:j] = True
+        return mask
+
+    while len(segments) < max_groups:
+        best_gain = 0.0
+        best_split = None  # (seg_idx, cut_bmi, left_mask, right_mask)
+
+        # 计算当前总目标函数：加权平均 t*（对每段）
+        def current_objective(segs):
+            num, den = 0.0, 0.0
+            for i, j in segs:
+                m = segment_indices((i, j))
+                tstar, F12 = _segment_score(dur[m], evt[m], target=target)
+                n = m.sum()
+                num += tstar * n
+                den += n
+            return num / max(den, 1.0)
+
+        base_obj = current_objective(segments)
+
+        for si, (i, j) in enumerate(segments):
+            n_seg = j - i
+            if n_seg < 2 * min_size:
+                continue
+            seg_mask = segment_indices((i, j))
+            seg_bmi = bmi[seg_mask]
+            # 候选切分点：动态分位，确保两侧样本数都 >= min_size
+            q_lo = min_size / n_seg
+            q_hi = 1.0 - min_size / n_seg
+            if q_hi <= q_lo:
+                continue
+            # 步长自适应（至少取5个点）
+            n_steps = max(5, int((q_hi - q_lo) / 0.05))
+            qs = np.linspace(q_lo, q_hi, n_steps)
+            cs = np.unique(np.quantile(seg_bmi, qs))
+
+            for c in cs:
+                left = seg_mask & (bmi <= c)
+                right = seg_mask & (bmi > c)
+                if left.sum() < min_size or right.sum() < min_size:
+                    continue
+                # 显著性（log-rank）
+                try:
+                    stat = logrank_test(
+                        dur[left],
+                        dur[right],
+                        event_observed_A=evt[left],
+                        event_observed_B=evt[right],
+                    )
+                    pval = float(stat.p_value)
+                except Exception:
+                    pval = 1.0
+                # 计算新目标值
+                new_segs = (
+                    segments[:si]
+                    + segments[si + 1 :]
+                    + [(i, i + left.sum()), (i + left.sum(), j)]
+                )
+                new_obj = current_objective(new_segs)
+                gain = base_obj - new_obj  # 目标下降越多越好（t*更早）
+
+                # 放宽切分准入门槛
+                if (pval < 0.10 and gain > 0.02) or (gain > 0.10):
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_split = (si, c, left, right)
+
+        if best_split is None:
+            break
+
+        # 应用最佳切分：在原df顺序上，把该段按BMI<=c、>c重排
+        si, c, left, right = best_split
+        i, j = segments[si]
+        # 左右的局部相对顺序不变
+        left_idx = np.where(left)[0]
+        right_idx = np.where(right)[0]
+        new_order = np.concatenate([left_idx, right_idx])
+        # 重新排列该段
+        for col in ["孕妇BMI", "duration_week", "event"]:
+            df.loc[i : j - 1, col] = df.loc[new_order, col].values
+            # 同步原数组
+        bmi = df["孕妇BMI"].to_numpy(float)
+        dur = df["duration_week"].to_numpy(float)
+        evt = df["event"].to_numpy(bool)
+        # 更新段列表
+        left_n = left.sum()
+        segments = (
+            segments[:si] + [(i, i + left_n), (i + left_n, j)] + segments[si + 1 :]
+        )
+
+    # 生成分组编码与标签（按BMI从低到高排序）
+    segments = sorted(segments, key=lambda x: df["孕妇BMI"].iloc[x[0] : x[1]].median())
+    group_id = np.zeros(len(df), dtype=int)
+    labels = []
+    boundaries = []
+    for k, (i, j) in enumerate(segments, start=1):
+        group_id[i:j] = k
+        lo = float(df["孕妇BMI"].iloc[i:j].min())
+        hi = float(df["孕妇BMI"].iloc[i:j].max())
+        labels.append(f"Supervised Q{k}: [{lo:.2f}, {hi:.2f}]")
+        boundaries.append(lo)
+    boundaries.append(
+        float(df["孕妇BMI"].iloc[segments[-1][0] : segments[-1][1]].max())
+    )
+    df["bmi_group"] = group_id
+    df["bmi_group_label"] = pd.Categorical(labels)[group_id - 1].astype(str)
+
+    return df, boundaries
 
 
 def main():
     # 定位数据与输出目录
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     data_path = os.path.join(base_dir, "Q1", "男胎检测数据_预处理后.csv")
-    out_dir = os.path.join(os.path.dirname(__file__), "output")
+    out_dir = os.path.join(os.path.dirname(__file__), f"output_{GROUPING_METHOD}")
     os.makedirs(out_dir, exist_ok=True)
 
     print(f"Reading data: {data_path}")
@@ -435,13 +596,20 @@ def main():
     )
 
     # BMI 分组
-    df_subj_g, boundaries = group_bmi(df_subj, n_groups=5)
+    if GROUPING_METHOD == "clinical":
+        df_subj_g, boundaries = group_bmi_clinical(df_subj)
+    elif GROUPING_METHOD == "supervised":
+        df_subj_g, boundaries = group_bmi_supervised(
+            df_subj, max_groups=MAX_GROUPS, min_size=MIN_GROUP_SIZE, target=SEG_TARGET
+        )
+    else:
+        df_subj_g, boundaries = group_bmi(df_subj, n_groups=5)
+
     # 保存分组边界
     bnd_df = pd.DataFrame(
         {
-            "quantile": [0, 0.2, 0.4, 0.6, 0.8, 1.0],
-            "BMI": boundaries
-            + ([] if len(boundaries) == 6 else [np.nan] * (6 - len(boundaries))),
+            "quantile": list(np.linspace(0, 1, len(boundaries)))[: len(boundaries)],
+            "BMI": boundaries + ([] if True else []),
         }
     )
     bnd_path = os.path.join(out_dir, "bmi_boundaries.csv")
@@ -484,7 +652,6 @@ def main():
     res_path = os.path.join(out_dir, "bmi_groups_results.csv")
     res_df.to_csv(res_path, index=False, encoding="utf-8-sig")
     print(f"Saved results table: {res_path}")
-
 
 if __name__ == "__main__":
     main()
