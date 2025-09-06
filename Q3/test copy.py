@@ -94,9 +94,9 @@ class NIPTDataProcessor:
 
         print(f"原始数据: {original_len}条记录")
 
-        # 1. 过滤检测孕周：保留 [10, 26) 区间
-        df = df[(df["J"] >= 10) & (df["J"] < 26)]
-        print(f"孕周过滤 [10w, 26w): {original_len} -> {len(df)}条记录")
+        # 1. 过滤检测孕周：保留 [10, 24) 区间
+        df = df[(df["J"] >= 10) & (df["J"] < 24)]
+        print(f"孕周过滤 [10w, 24w): {original_len} -> {len(df)}条记录")
 
         # 2. 过滤BMI极端异常值
         # 使用IQR方法识别异常值
@@ -104,9 +104,9 @@ class NIPTDataProcessor:
         Q3 = df["K"].quantile(0.75)
         IQR = Q3 - Q1
 
-        # 定义异常值范围（1.5倍IQR规则，但设置合理的BMI范围）
-        lower_bound = max(Q1 - 1.5 * IQR, 15.0)  # BMI不低于15
-        upper_bound = min(Q3 + 1.5 * IQR, 50.0)  # BMI不高于50
+        # 定义异常值范围（1.2倍IQR规则，但设置合理的BMI范围）
+        lower_bound = max(Q1 - 1.2 * IQR, 15.0)  # BMI不低于15
+        upper_bound = min(Q3 + 1.2 * IQR, 50.0)  # BMI不高于50
 
         before_bmi_filter = len(df)
         df = df[(df["K"] >= lower_bound) & (df["K"] <= upper_bound)]
@@ -177,10 +177,12 @@ class Problem3Solver:
 
         # 使用随机森林建模概率
         self.prob_model = RandomForestClassifier(
-            n_estimators=150,
-            max_depth=10,
-            min_samples_split=15,
-            min_samples_leaf=5,
+            n_estimators=300,
+            max_depth=12,
+            min_samples_split=10,
+            min_samples_leaf=3,
+            max_features="sqrt",
+            class_weight="balanced",
             random_state=42,
         )
         self.prob_model.fit(X_scaled, target)
@@ -249,12 +251,12 @@ class Problem3Solver:
         """计算考虑多因素和测量误差的期望风险"""
         if risk_weights is None:
             risk_weights = {
-                "early": 1.0,
-                "mid": 3.0,
-                "late": 5.0,
-                "retest": 2.0,
-                "low_attain": 50.0,
-                "error": 5.0,
+                "early": 0.8,
+                "mid": 2.5,
+                "late": 15.0,
+                "retest": 1.5,
+                "low_attain": 80.0,
+                "error": 3.0,
             }
 
         # 计算群体达标率
@@ -300,15 +302,22 @@ class Problem3Solver:
         group_df,
         pi_min=0.90,
         metric="ET",
-        step0=0.5,
-        step1=0.5,
-        late_cap=26,
+        step0=0.25,
+        step1=0.25,
+        late_cap=24,
         tau=25,
         cw=None,
     ):
         """两阶段最佳时点搜索"""
         if cw is None:
-            cw = {"early": 1, "mid": 3, "late": 10, "retest": 2, "short": 50, "err": 5}
+            cw = {
+                "early": 0.8,
+                "mid": 2.5,
+                "late": 15,
+                "retest": 1.5,
+                "short": 80,
+                "err": 3,
+            }
 
         # 1) 预计算 F_g(t)
         T0 = np.arange(10, 20 + 1e-9, step0)
@@ -413,7 +422,7 @@ class Problem3Solver:
         }
 
     def multifactor_grouping_optimization(
-        self, df, max_groups=4, min_attain_rate=0.9, measurement_error=0.05
+        self, df, max_groups=5, min_attain_rate=0.92, measurement_error=0.03
     ):
         """多因素分组优化（使用强制分离的分组策略）"""
         print(
@@ -610,7 +619,7 @@ class Problem3Solver:
 
     # ---------------- 新增：Turnbull NPMLE（简化、数值稳定） ----------------
     def turnbull_npmle(
-        self, iv_df: pd.DataFrame, max_iter: int = 2000, tol: float = 1e-8
+        self, iv_df: pd.DataFrame, max_iter: int = 3000, tol: float = 1e-10
     ):
         """
         输入 iv_df 包含 L, R, censor_type，返回 dict {support, mass, S, F}
@@ -951,9 +960,11 @@ class Problem3Solver:
 
         # 不同参数组合
         sensitivity_params = [
-            {"min_attain_rate": 0.85, "measurement_error": 0.03, "name": "宽松约束"},
-            {"min_attain_rate": 0.90, "measurement_error": 0.05, "name": "标准约束"},
-            {"min_attain_rate": 0.95, "measurement_error": 0.08, "name": "严格约束"},
+            {"min_attain_rate": 0.88, "measurement_error": 0.02, "name": "宽松约束"},
+            {"min_attain_rate": 0.92, "measurement_error": 0.03, "name": "标准约束"},
+            {"min_attain_rate": 0.96, "measurement_error": 0.05, "name": "严格约束"},
+            {"min_attain_rate": 0.90, "measurement_error": 0.01, "name": "高精度测量"},
+            {"min_attain_rate": 0.94, "measurement_error": 0.07, "name": "保守策略"},
         ]
 
         sensitivity_results = []
@@ -1255,7 +1266,7 @@ def run_problem3():
     # 步骤2：多因素分组优化
     print("\n步骤2：多因素分组优化")
     optimal_groups = solver.multifactor_grouping_optimization(
-        male_df, min_attain_rate=0.9, measurement_error=0.05
+        male_df, min_attain_rate=0.92, measurement_error=0.03
     )
 
     # 步骤3：敏感性分析
