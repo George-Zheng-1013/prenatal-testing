@@ -83,36 +83,42 @@ class NIPTDataProcessor:
             print(f"数据加载失败: {e}")
             return False
 
-    def parse_gestational_week(self, week_str):
-        """解析孕周格式 (如 '11w+6' -> 11.857)"""
-        if pd.isna(week_str) or week_str == "":
-            return np.nan
-
-        try:
-            week_str = str(week_str).strip()
-            if "w" in week_str:
-                parts = week_str.split("w")
-                weeks = float(parts[0])
-                if "+" in parts[1]:
-                    days = float(parts[1].replace("+", ""))
-                    return weeks + days / 7.0
-                else:
-                    return weeks
-            else:
-                return float(week_str)
-        except:
-            return np.nan
-
     def preprocess_male_data(self):
-        """预处理男胎数据 - 数据已经预处理过，直接返回"""
+        """预处理男胎数据 - 添加数据过滤"""
         if self.male_data is None:
             print("请先加载数据")
             return None
 
         df = self.male_data.copy()
+        original_len = len(df)
 
-        # 数据已经预处理过，直接使用
-        print(f"使用预处理后的男胎数据: {len(df)}条记录")
+        print(f"原始数据: {original_len}条记录")
+
+        # 1. 过滤检测孕周：保留 [10, 26) 区间
+        df = df[(df["J"] >= 10) & (df["J"] < 26)]
+        print(f"孕周过滤 [10w, 26w): {original_len} -> {len(df)}条记录")
+
+        # 2. 过滤BMI极端异常值
+        # 使用IQR方法识别异常值
+        Q1 = df["K"].quantile(0.25)
+        Q3 = df["K"].quantile(0.75)
+        IQR = Q3 - Q1
+
+        # 定义异常值范围（1.5倍IQR规则，但设置合理的BMI范围）
+        lower_bound = max(Q1 - 1.5 * IQR, 15.0)  # BMI不低于15
+        upper_bound = min(Q3 + 1.5 * IQR, 50.0)  # BMI不高于50
+
+        before_bmi_filter = len(df)
+        df = df[(df["K"] >= lower_bound) & (df["K"] <= upper_bound)]
+        print(
+            f"BMI异常值过滤 [{lower_bound:.1f}, {upper_bound:.1f}]: {before_bmi_filter} -> {len(df)}条记录"
+        )
+
+        # 3. 过滤其他必要的缺失值
+        df = df.dropna(subset=["B", "K", "J", "V"])  # 孕妇代码、BMI、孕周、Y染色体浓度
+        print(f"缺失值过滤: {len(df)}条记录")
+
+        print(f"最终数据: {len(df)}条记录 (过滤掉{original_len - len(df)}条)")
         return df.reset_index(drop=True)
 
 
@@ -326,18 +332,18 @@ class Problem3Solver:
     def multifactor_grouping_optimization(
         self, df, max_groups=4, min_attain_rate=0.9, measurement_error=0.05
     ):
-        """多因素分组优化（只使用聚类分组）"""
+        """多因素分组优化（使用强制分离的分组策略）"""
         print(
             f"多因素分组优化 (最小达标率: {min_attain_rate:.1%}, 测量误差: {measurement_error:.1%})..."
         )
 
-        # 仅使用多因素聚类分组策略
+        # 使用强制分离的分组策略
         best_groups = None
         best_total_risk = np.inf
         best_strategy = ""
 
-        print("尝试多因素聚类分组策略...")
-        groups = self._group_by_clustering(
+        print("尝试强制BMI区间分离的分组策略...")
+        groups = self._group_by_forced_separation(
             df, max_groups, min_attain_rate, measurement_error
         )
         if groups is not None:
@@ -346,21 +352,119 @@ class Problem3Solver:
             ).sum() / groups["n_patients"].sum()
             best_total_risk = total_risk
             best_groups = groups
-            best_strategy = "多因素聚类分组"
+            best_strategy = "强制区间分离分组"
 
         self.optimal_groups = best_groups
         print(f"最优分组策略: {best_strategy}, 总体期望风险: {best_total_risk:.4f}")
 
         return self.optimal_groups
 
+    def _group_by_forced_separation(
+        self, df, n_groups, min_attain_rate, measurement_error
+    ):
+        """使用强制分离的分组方法，确保BMI区间完全不重叠"""
+        # 基于BMI排序
+        df_sorted = df.sort_values("K").reset_index(drop=True)
+
+        # 计算理想的分组大小
+        total_samples = len(df_sorted)
+        target_size = total_samples // n_groups
+
+        groups_info = []
+
+        for i in range(n_groups):
+            start_idx = i * target_size
+            if i == n_groups - 1:  # 最后一组包含剩余所有样本
+                end_idx = total_samples
+            else:
+                end_idx = (i + 1) * target_size
+
+            group_df = df_sorted.iloc[start_idx:end_idx].copy()
+
+            if len(group_df) < 10:
+                continue
+
+            # 计算明确的BMI区间边界
+            bmi_min = group_df["K"].min()
+            bmi_max = group_df["K"].max()
+
+            # 为了确保完全分离，调整边界
+            if i < n_groups - 1:
+                # 不是最后一组，需要确保与下一组分离
+                next_start_idx = (i + 1) * target_size
+                if next_start_idx < total_samples:
+                    next_min_bmi = df_sorted.iloc[next_start_idx]["K"]
+                    # 设置当前组的最大值为当前组最后一个样本的BMI值
+                    bmi_max = group_df["K"].iloc[-1]
+                    # 确保与下一组有明确分界
+                    if bmi_max >= next_min_bmi:
+                        # 如果仍有重叠，使用中点作为分界
+                        bmi_max = (bmi_max + next_min_bmi) / 2 - 0.01
+
+            # 添加cluster标签用于后续模型拟合
+            group_df = group_df.copy()
+            group_df["cluster"] = i
+
+            # 优化该组的检测时间
+            opt_time, opt_risk, opt_attain, opt_eff_attain = (
+                self.optimize_group_testing_time(
+                    group_df,
+                    min_attain_rate=min_attain_rate,
+                    measurement_error=measurement_error,
+                )
+            )
+
+            group_stats = self.calculate_group_statistics(group_df)
+
+            groups_info.append(
+                {
+                    "group_id": i + 1,
+                    "bmi_min": bmi_min,
+                    "bmi_max": bmi_max,
+                    "bmi_range": f"[{bmi_min:.1f}, {bmi_max:.1f}{')'if i < n_groups - 1 else ']'}",
+                    "optimal_week": opt_time,
+                    "expected_risk": opt_risk,
+                    "attainment_rate": opt_attain,
+                    "effective_attainment_rate": opt_eff_attain,
+                    **group_stats,
+                }
+            )
+
+        # 为整个数据集创建cluster列用于事件时间模型
+        df_with_clusters = df.copy()
+        df_with_clusters["cluster"] = -1
+
+        for i, group_info in enumerate(groups_info):
+            bmi_min = group_info["bmi_min"]
+            bmi_max = group_info["bmi_max"]
+            if i < len(groups_info) - 1:  # 不是最后一组
+                mask = (df_with_clusters["K"] >= bmi_min) & (
+                    df_with_clusters["K"] < bmi_max
+                )
+            else:  # 最后一组
+                mask = (df_with_clusters["K"] >= bmi_min) & (
+                    df_with_clusters["K"] <= bmi_max
+                )
+            df_with_clusters.loc[mask, "cluster"] = i
+
+        # 为每个cluster拟合组级事件时间模型
+        self._fit_group_event_models(
+            df_with_clusters, id_col="B", time_col="J_week", value_col="V", thr=0.04
+        )
+
+        return pd.DataFrame(groups_info) if groups_info else None
+
     def calculate_group_statistics(self, group_df):
-        """计算群体统计特征"""
+        """计算群体统计特征 - 修正：使用唯一孕妇ID计算人数"""
+        # 计算唯一孕妇数量，而不是记录数量
+        unique_patients = group_df["B"].nunique()  # 使用孕妇代码计算唯一人数
+
         stats = {
             "avg_age": group_df["C"].mean(),
             "avg_height": group_df["D"].mean(),
             "avg_weight": group_df["E"].mean(),
             "avg_bmi": group_df["K"].mean(),
-            "n_patients": len(group_df),
+            "n_patients": unique_patients,  # 修正：使用唯一孕妇数量
         }
         return stats
 
@@ -521,26 +625,51 @@ class Problem3Solver:
         self.group_surv = group_surv
 
     def _group_by_clustering(self, df, n_groups, min_attain_rate, measurement_error):
-        """基于多因素的聚类分组"""
+        """基于多因素的聚类分组 - 改进版本减少重叠"""
         from sklearn.cluster import KMeans
+        from sklearn.tree import DecisionTreeRegressor
 
-        # 准备聚类特征
-        cluster_features = df[["K", "C", "D", "E"]].copy()  # BMI, 年龄, 身高, 体重
+        # 使用改进的聚类方法，重点解决重叠问题
+        # 准备聚类特征，给BMI更高的权重
+        cluster_features = df[["K", "C", "D", "E"]].copy()
 
-        # 标准化
+        # 标准化，但保持BMI的相对重要性
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(cluster_features)
 
-        # K-means聚类
-        kmeans = KMeans(n_clusters=n_groups, random_state=42)
-        df_temp = df.copy()
-        df_temp["cluster"] = kmeans.fit_predict(X_scaled)
+        # 给BMI列（第0列）增加权重
+        X_scaled[:, 0] *= 3.0  # BMI权重增加3倍
 
-        # ------------- 新增：为每个 cluster 拟合组级事件时间模型 -------------
-        self._fit_group_event_models(
-            df_temp, id_col="A", time_col="J_week", value_col="V", thr=0.04
+        # 尝试多次聚类，选择BMI分离度最好的结果
+        best_labels = None
+        best_separation_score = -np.inf
+
+        for random_state in range(42, 52):  # 尝试10个不同的随机种子
+            kmeans = KMeans(n_clusters=n_groups, random_state=random_state, n_init=10)
+            labels = kmeans.fit_predict(X_scaled)
+
+            # 计算BMI分离度分数
+            separation_score = self._calculate_bmi_separation_score(
+                df, labels, n_groups
+            )
+
+            if separation_score > best_separation_score:
+                best_separation_score = separation_score
+                best_labels = labels.copy()
+
+        df_temp = df.copy()
+
+        # 进一步优化：使用决策树来优化边界
+        best_labels = self._optimize_boundaries_with_tree(
+            df_temp, best_labels, n_groups
         )
-        # -------------------------------------------------------------------
+
+        df_temp["cluster"] = best_labels
+
+        # 为每个cluster拟合组级事件时间模型
+        self._fit_group_event_models(
+            df_temp, id_col="B", time_col="J_week", value_col="V", thr=0.04
+        )
 
         groups_info = []
 
@@ -576,6 +705,145 @@ class Problem3Solver:
             )
 
         return pd.DataFrame(groups_info) if groups_info else None
+
+    def _calculate_bmi_separation_score(self, df, labels, n_groups):
+        """计算BMI分组的分离度分数，分数越高表示重叠越少"""
+        group_ranges = []
+
+        for i in range(n_groups):
+            mask = labels == i
+            if mask.sum() > 0:
+                bmi_min = df[mask]["K"].min()
+                bmi_max = df[mask]["K"].max()
+                group_ranges.append((bmi_min, bmi_max))
+
+        if len(group_ranges) < 2:
+            return 0
+
+        # 按最小BMI排序
+        group_ranges.sort(key=lambda x: x[0])
+
+        # 计算分离度：相邻组之间的间隙 vs 组内范围
+        separation_score = 0
+        total_overlap = 0
+
+        for i in range(len(group_ranges) - 1):
+            current_max = group_ranges[i][1]
+            next_min = group_ranges[i + 1][0]
+
+            if current_max > next_min:  # 有重叠
+                overlap = current_max - next_min
+                total_overlap += overlap
+            else:  # 有间隙，这是好的
+                gap = next_min - current_max
+                separation_score += gap
+
+        # 分离度分数 = 间隙总和 - 重叠惩罚
+        return separation_score - total_overlap * 2
+
+    def _optimize_boundaries_with_tree(self, df, initial_labels, n_groups):
+        """使用决策树优化分组边界以减少重叠"""
+        from sklearn.tree import DecisionTreeClassifier
+
+        # 按BMI对分组重新排序
+        group_medians = []
+        for i in range(n_groups):
+            mask = initial_labels == i
+            if mask.sum() > 0:
+                median_bmi = df[mask]["K"].median()
+                group_medians.append((i, median_bmi))
+
+        group_medians.sort(key=lambda x: x[1])
+
+        # 重新映射标签
+        label_mapping = {
+            old_id: new_id for new_id, (old_id, _) in enumerate(group_medians)
+        }
+        ordered_labels = np.array([label_mapping[label] for label in initial_labels])
+
+        # 使用决策树来学习更好的分组边界
+        features = df[["K", "C", "D", "E"]].values
+
+        try:
+            dt = DecisionTreeClassifier(
+                max_depth=3, min_samples_split=20, min_samples_leaf=10, random_state=42
+            )
+            dt.fit(features, ordered_labels)
+
+            # 使用决策树预测新的标签
+            new_labels = dt.predict(features)
+
+            # 验证新标签是否减少了重叠
+            old_score = self._calculate_bmi_separation_score(
+                df, ordered_labels, n_groups
+            )
+            new_score = self._calculate_bmi_separation_score(df, new_labels, n_groups)
+
+            if new_score > old_score:
+                return new_labels
+            else:
+                return ordered_labels
+
+        except Exception as e:
+            print(f"决策树优化失败，使用原始聚类结果: {e}")
+            return ordered_labels
+
+    def _adjust_clusters_for_bmi_separation(self, df, cluster_labels, n_groups):
+        """调整聚类结果以减少BMI重叠"""
+        df_temp = df.copy()
+        df_temp["original_cluster"] = cluster_labels
+
+        # 计算每个聚类的BMI中位数
+        cluster_medians = []
+        for i in range(n_groups):
+            mask = cluster_labels == i
+            if mask.sum() > 0:
+                median_bmi = df_temp[mask]["K"].median()
+                cluster_medians.append((i, median_bmi))
+
+        # 按BMI中位数排序聚类
+        cluster_medians.sort(key=lambda x: x[1])
+
+        # 重新分配聚类标签
+        new_labels = np.zeros_like(cluster_labels)
+        for new_id, (old_id, _) in enumerate(cluster_medians):
+            mask = cluster_labels == old_id
+            new_labels[mask] = new_id
+
+        # 进一步调整边界以减少重叠
+        adjusted_labels = new_labels.copy()
+
+        for i in range(len(cluster_medians) - 1):
+            # 找到相邻两组的BMI重叠区域
+            group_i_mask = new_labels == i
+            group_j_mask = new_labels == i + 1
+
+            if group_i_mask.sum() == 0 or group_j_mask.sum() == 0:
+                continue
+
+            group_i_max = df_temp[group_i_mask]["K"].max()
+            group_j_min = df_temp[group_j_mask]["K"].min()
+
+            # 如果有重叠，找到合适的分割点
+            if group_i_max > group_j_min:
+                # 使用两组BMI的加权平均作为分割点
+                group_i_median = df_temp[group_i_mask]["K"].median()
+                group_j_median = df_temp[group_j_mask]["K"].median()
+                split_point = (group_i_median + group_j_median) / 2
+
+                # 重新分配重叠区域的点
+                overlap_mask = (df_temp["K"] >= group_j_min) & (
+                    df_temp["K"] <= group_i_max
+                )
+                overlap_indices = df_temp[overlap_mask].index
+
+                for idx in overlap_indices:
+                    if df_temp.loc[idx, "K"] <= split_point:
+                        adjusted_labels[df_temp.index.get_loc(idx)] = i
+                    else:
+                        adjusted_labels[df_temp.index.get_loc(idx)] = i + 1
+
+        return adjusted_labels
 
     def sensitivity_analysis(self, df):
         """敏感性分析"""
