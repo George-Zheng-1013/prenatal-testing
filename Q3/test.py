@@ -29,53 +29,54 @@ class NIPTDataProcessor:
         self.female_data = None
 
     def load_data(self, file_path):
-        """加载Excel数据"""
+        """加载CSV数据"""
         try:
-            # 读取男胎和女胎数据
-            self.male_data = pd.read_excel(file_path, sheet_name="男胎检测数据")
-            self.female_data = pd.read_excel(file_path, sheet_name="女胎检测数据")
+            # 读取预处理后的男胎数据（CSV格式）
+            self.male_data = pd.read_csv(file_path)
+            self.female_data = None  # 问题3只需要男胎数据
 
-            # 重命名列为标准格式
-            columns = [
-                "A",
-                "B",
-                "C",
-                "D",
-                "E",
-                "F",
-                "G",
-                "H",
-                "I",
-                "J",
-                "K",
-                "L",
-                "M",
-                "N",
-                "O",
-                "P",
-                "Q",
-                "R",
-                "S",
-                "T",
-                "U",
-                "V",
-                "W",
-                "X",
-                "Y",
-                "Z",
-                "AA",
-                "AB",
-                "AC",
-                "AD",
-                "AE",
-            ]
+            # 创建列名映射：中文列名到字母列名
+            column_mapping = {
+                "序号": "A",
+                "孕妇代码": "B",
+                "年龄": "C",
+                "身高": "D",
+                "体重": "E",
+                "末次月经": "F",
+                "IVF妊娠": "G",
+                "检测日期": "H",
+                "检测抽血次数": "I",
+                "检测孕周": "J",
+                "孕妇BMI": "K",
+                "原始读段数": "L",
+                "在参考基因组上比对的比例": "M",
+                "重复读段的比例": "N",
+                "唯一比对的读段数  ": "O",  # 注意这里有多余空格
+                "GC含量": "P",
+                "13号染色体的Z值": "Q",
+                "18号染色体的Z值": "R",
+                "21号染色体的Z值": "S",
+                "X染色体的Z值": "T",
+                "Y染色体的Z值": "U",
+                "Y染色体浓度": "V",
+                "X染色体浓度": "W",
+                "13号染色体的GC含量": "X",
+                "18号染色体的GC含量": "Y",
+                "21号染色体的GC含量": "Z",
+                "被过滤掉读段数的比例": "AA",
+                "染色体的非整倍体": "AB",
+                "怀孕次数": "AC",
+                "生产次数": "AD",
+                "胎儿是否健康": "AE",
+            }
 
-            self.male_data.columns = columns[: len(self.male_data.columns)]
-            self.female_data.columns = columns[: len(self.female_data.columns)]
+            # 重命名列为字母格式以保持代码兼容性
+            self.male_data = self.male_data.rename(columns=column_mapping)
 
-            print(
-                f"成功加载数据: 男胎{len(self.male_data)}条, 女胎{len(self.female_data)}条"
-            )
+            # 添加解析后的孕周列
+            self.male_data["J_week"] = self.male_data["J"]  # 孕周已经预处理过
+
+            print(f"成功加载数据: 男胎{len(self.male_data)}条")
             return True
 
         except Exception as e:
@@ -103,39 +104,15 @@ class NIPTDataProcessor:
             return np.nan
 
     def preprocess_male_data(self):
-        """预处理男胎数据"""
+        """预处理男胎数据 - 数据已经预处理过，直接返回"""
         if self.male_data is None:
             print("请先加载数据")
             return None
 
         df = self.male_data.copy()
 
-        # 转换孕周格式
-        df["J_week"] = df["J"].apply(self.parse_gestational_week)
-
-        # 质量控制过滤
-        original_len = len(df)
-
-        # 1. 过滤极端GC含量
-        df = df[(df["P"] >= 0.35) & (df["P"] <= 0.65)]
-
-        # 2. 过滤低质量测序数据
-        df = df[df["L"] >= 1000000]  # 至少100万读段
-        df = df[df["AA"] <= 0.5]  # 过滤比例不超过50%
-
-        # 3. 过滤缺失的核心变量
-        df = df.dropna(subset=["V", "K", "J_week"])
-
-        # 4. Y染色体浓度范围过滤
-        df = df[(df["V"] >= 0) & (df["V"] <= 1)]
-
-        # 5. BMI合理范围
-        df = df[(df["K"] >= 15) & (df["K"] <= 50)]
-
-        # 6. 孕周范围
-        df = df[(df["J_week"] >= 8) & (df["J_week"] <= 30)]
-
-        print(f"男胎数据预处理: {original_len} -> {len(df)}条记录")
+        # 数据已经预处理过，直接使用
+        print(f"使用预处理后的男胎数据: {len(df)}条记录")
         return df.reset_index(drop=True)
 
 
@@ -230,7 +207,27 @@ class Problem3Solver:
         return probabilities
 
     def calculate_group_attainment_rate(self, group_df, test_week):
-        """计算群体在指定孕周的达标比例"""
+        """计算群体在指定孕周的达标比例。若存在组级事件时间模型，则用 F_g(t)；否则用横断面概率均值。"""
+        # 若 group_df 包含 cluster 标签并且模型已拟合，使用事件时间分布
+        if (
+            "cluster" in group_df.columns
+            and hasattr(self, "group_surv")
+            and self.group_surv
+        ):
+            cluster_vals = group_df["cluster"].unique()
+            # 若 group_df 来自单个cluster，则直接使用
+            if len(cluster_vals) == 1:
+                g = int(cluster_vals[0])
+                res = self.group_surv.get(g, None)
+                if res is not None:
+                    Sg_t = self.eval_step_S(
+                        np.array([test_week]), res["support"], res["S"]
+                    )
+                    Fg_t = 1.0 - Sg_t[0]
+                    # 若估计失败则回退到横断面概率预测
+                    if np.isfinite(Fg_t):
+                        return float(Fg_t)
+        # 回退：使用当前横断面概率平均（不改变外部接口）
         individual_probs = self.predict_attainment_probability(group_df, test_week)
         group_rate = individual_probs.mean()
         return group_rate
@@ -367,6 +364,162 @@ class Problem3Solver:
         }
         return stats
 
+    def build_intervals_from_longitudinal(
+        self,
+        df: pd.DataFrame,
+        id_col: str = "A",
+        time_col: str = "J_week",
+        value_col: str = "V",
+        thr: float = 0.04,
+    ) -> pd.DataFrame:
+        """
+        将同一孕妇的多次测量转换为首次达标的区间删失 (L, R]：
+        - 若从未达标：右删失 (C, +inf)，此处用 L=C, R=inf, censor='right'
+        - 若第一次测到达标为首测：左删失 (-inf, R]
+        - 否则：区间删失 (L, R]
+        返回列：id, L, R, censor_type
+        """
+        dfc = df[[id_col, time_col, value_col]].dropna(subset=[id_col, time_col]).copy()
+        dfc = dfc.sort_values([id_col, time_col])
+        rows = []
+        for pid, g in dfc.groupby(id_col):
+            weeks = g[time_col].to_numpy(dtype=float)
+            vals = g[value_col].to_numpy(dtype=float)
+            hit_idx = np.where(vals >= thr)[0]
+            if hit_idx.size == 0:
+                # 右删失：用最后一次检测周作为C (L=C, R=+inf)
+                if weeks.size == 0:
+                    continue
+                L = weeks[-1]
+                R = np.inf
+                censor = "right"
+            else:
+                r = int(hit_idx[0])
+                R = weeks[r]
+                if r == 0:
+                    L = -np.inf
+                    censor = "left"
+                else:
+                    L = weeks[r - 1]
+                    censor = "interval"
+            rows.append(
+                {"id": pid, "L": float(L), "R": float(R), "censor_type": censor}
+            )
+        return pd.DataFrame(rows)
+
+    # ---------------- 新增：Turnbull NPMLE（简化、数值稳定） ----------------
+    def turnbull_npmle(
+        self, iv_df: pd.DataFrame, max_iter: int = 2000, tol: float = 1e-8
+    ):
+        """
+        输入 iv_df 包含 L, R, censor_type，返回 dict {support, mass, S, F}
+        简化实现：支持点取所有有限端点并用 EM 更新质量
+        """
+        g = iv_df.copy()
+        L = g["L"].to_numpy(dtype=float)
+        R = g["R"].to_numpy(dtype=float)
+        finite_L = L[np.isfinite(L)]
+        finite_R = R[np.isfinite(R)]
+        if finite_L.size + finite_R.size == 0:
+            return {
+                "support": np.array([]),
+                "mass": np.array([]),
+                "S": np.array([]),
+                "F": np.array([]),
+            }
+        support = np.unique(np.concatenate([finite_L, finite_R]))
+        K = len(support)
+        n = len(g)
+        # 构建 J_i 集合
+        J = []
+        for Li, Ri in zip(L, R):
+            if np.isneginf(Li) and np.isfinite(Ri):
+                idx = np.where(support <= Ri)[0]
+            elif np.isposinf(Ri) and np.isfinite(Li):
+                idx = np.where(support > Li)[0]
+            else:
+                idx = np.where((support > Li) & (support <= Ri))[0]
+            if idx.size == 0:
+                near = np.searchsorted(support, np.nan_to_num(Ri, nan=Li))
+                near = min(max(0, near - 1), K - 1)
+                idx = np.array([near], dtype=int)
+            J.append(idx)
+        # 初始化均匀分布
+        p = np.full(K, 1.0 / K, dtype=float)
+        for it in range(max_iter):
+            counts = np.zeros(K, dtype=float)
+            for idx in J:
+                den = p[idx].sum()
+                if den <= 0:
+                    counts[idx] += 1.0 / len(idx)
+                else:
+                    counts[idx] += p[idx] / den
+            p_new = counts / n
+            # 数值修正
+            p_new[p_new < 1e-12] = 0.0
+            s = p_new.sum()
+            if s <= 0:
+                p_new = np.full(K, 1.0 / K, dtype=float)
+            else:
+                p_new = p_new / s
+            if np.linalg.norm(p_new - p, ord=1) < tol:
+                p = p_new
+                break
+            p = p_new
+        F = np.cumsum(p)
+        S = 1.0 - F
+        return {"support": support, "mass": p, "S": S, "F": F}
+
+    # ---------------- 新增：阶梯生存函数在任意 t 上求值 ----------------
+    def eval_step_S(
+        self, t: np.ndarray, support: np.ndarray, S_support: np.ndarray
+    ) -> np.ndarray:
+        """
+        阶梯函数评估：对于 t < support[0] -> S=1；对于 support[j-1] < t <= support[j] -> S=S_support[j]
+        """
+        if support.size == 0:
+            return np.ones_like(t, dtype=float)
+        idx = np.searchsorted(support, t, side="right") - 1
+        idx = np.clip(idx, -1, len(support) - 1)
+        out = np.empty_like(t, dtype=float)
+        mask_before = idx < 0
+        out[mask_before] = 1.0
+        mask_other = ~mask_before
+        out[mask_other] = S_support[idx[mask_other]]
+        return out
+
+    # ---------------- 新增：对每个聚类组拟合事件时间模型 ----------------
+    def _fit_group_event_models(
+        self, df_with_cluster, id_col="A", time_col="J_week", value_col="V", thr=0.04
+    ):
+        """
+        对含有 cluster 列的数据，构建组内区间删失并为每组计算 NPMLE，结果保存在 self.group_surv（dict）
+        """
+        if "cluster" not in df_with_cluster.columns:
+            self.group_surv = {}
+            return
+        iv_all = self.build_intervals_from_longitudinal(
+            df_with_cluster,
+            id_col=id_col,
+            time_col=time_col,
+            value_col=value_col,
+            thr=thr,
+        )
+        group_surv = {}
+        for g in sorted(df_with_cluster["cluster"].unique()):
+            ids = df_with_cluster[df_with_cluster["cluster"] == g][id_col].unique()
+            iv_g = iv_all[iv_all["id"].isin(ids)].reset_index(drop=True)
+            if iv_g.shape[0] == 0:
+                group_surv[g] = {
+                    "support": np.array([]),
+                    "mass": np.array([]),
+                    "S": np.array([]),
+                }
+                continue
+            res = self.turnbull_npmle(iv_g)
+            group_surv[g] = res
+        self.group_surv = group_surv
+
     def _group_by_clustering(self, df, n_groups, min_attain_rate, measurement_error):
         """基于多因素的聚类分组"""
         from sklearn.cluster import KMeans
@@ -382,6 +535,12 @@ class Problem3Solver:
         kmeans = KMeans(n_clusters=n_groups, random_state=42)
         df_temp = df.copy()
         df_temp["cluster"] = kmeans.fit_predict(X_scaled)
+
+        # ------------- 新增：为每个 cluster 拟合组级事件时间模型 -------------
+        self._fit_group_event_models(
+            df_temp, id_col="A", time_col="J_week", value_col="V", thr=0.04
+        )
+        # -------------------------------------------------------------------
 
         groups_info = []
 
@@ -667,15 +826,56 @@ def run_problem3():
 
     # 加载数据
     if not processor.load_data(
-        r"D:\HP\OneDrive\Desktop\学校\竞赛\数模国赛\CUMCM2025Problems\C题\附件.xlsx"
+        r"D:\HP\OneDrive\Desktop\学校\竞赛\数模国赛\CUMCM2025Problems\C题\prenatal-testing\Q3\男胎检测数据_预处理后.csv"
     ):
-        print("数据加载失败，请检查文件'附件.xlsx'是否存在")
+        print("数据加载失败，请检查文件'男胎检测数据_预处理后.csv'是否存在")
         return None
 
     male_df = processor.preprocess_male_data()
     if male_df is None or len(male_df) == 0:
         print("男胎数据预处理失败")
         return None
+
+    # --- 插入：构造区间删失并诊断事件时间信息量 ---
+    # 去除同一ID同一孕周的重复：保留最大V（或最近一次）
+    male_df = (
+        male_df.sort_values(["B", "J_week", "V"])
+        .groupby(["B", "J_week"], as_index=False)
+        .last()
+    )
+
+    # 统计具有多次随访的ID数量
+    id_counts = male_df["B"].value_counts()  # 使用孕妇代码而不是序号
+    n_multi = int((id_counts > 1).sum())
+    print(f"具有多次测量的ID数量: {n_multi}")
+
+    # 构建区间删失表并展示前几行
+    iv_df = Problem3Solver(processor).build_intervals_from_longitudinal(
+        male_df, id_col="B", time_col="J_week", value_col="V", thr=0.04  # 使用孕妇代码
+    )
+    print("区间删失样例（最多10条）：")
+    print(iv_df.head(10).to_string(index=False))
+
+    # 若信息足够，拟合全体 NPMLE 并在若干时间点评估 F(t)
+    if iv_df.shape[0] >= 30 and n_multi >= 30:
+        solver_tmp = Problem3Solver(processor)
+        npmle_all = solver_tmp.turnbull_npmle(iv_df)
+        print(
+            "NPMLE support_len:",
+            len(npmle_all["support"]),
+            " mass_sum:",
+            float(np.sum(npmle_all["mass"])),
+        )
+        for t in [12, 16, 20, 24]:
+            St = solver_tmp.eval_step_S(
+                np.array([t]), npmle_all["support"], npmle_all["S"]
+            )[0]
+            print(f"F({t}) = {1.0 - St:.3f}")
+    else:
+        print(
+            "警告：纵向信息不足，NPMLE 估计可能不可靠（建议至少若干十个有重复测量的ID）"
+        )
+    # -----------------------------------------------------
 
     # 创建求解器
     solver = Problem3Solver(processor)
