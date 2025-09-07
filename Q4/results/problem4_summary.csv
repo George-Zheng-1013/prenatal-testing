@@ -1,0 +1,2 @@
+﻿model_used,optimal_threshold,total_samples,predicted_abnormal,actual_abnormal,high_risk_samples,high_risk_accuracy,overall_accuracy,auc,precision,recall,f1_score
+logistic_l1,0.40000000000000013,61,20,7,5,0.4,0.7868852459016393,0.8862433862433863,0.35,1.0,0.5185185185185185

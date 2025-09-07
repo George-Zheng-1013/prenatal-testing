@@ -1,0 +1,5 @@
+﻿rule,count,abnormal_count,precision
+direct_abnormal,3,1,0.3333333333333333
+high_risk_retest,2,1,0.5
+model_based,16,5,0.3125
+normal,40,0,0.0
