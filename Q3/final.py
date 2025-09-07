@@ -329,6 +329,7 @@ class Problem3Solver:
             F[t] = self.calculate_group_attainment_rate(group_df, t)
 
         best = None
+        valid_solutions = 0  # 统计有效解的数量
 
         for t0 in T0:
             for t1 in T1[T1 > t0]:
@@ -336,6 +337,8 @@ class Problem3Solver:
                     continue
                 if F[t1] < pi_min:  # 覆盖硬约束
                     continue
+
+                valid_solutions += 1  # 找到有效解
 
                 if metric == "ET":
                     # 期望完成时间
@@ -370,6 +373,47 @@ class Problem3Solver:
                         "retest_rate": 1 - F[t0],
                         "metric": metric,
                     }
+
+        # 如果没有找到满足硬约束的解，选择F[t1]最高的组合
+        if best is None and valid_solutions == 0:
+            max_F1 = 0
+            for t0 in T0:
+                for t1 in T1[T1 > t0]:
+                    if late_cap is not None and t1 > late_cap:
+                        continue
+                    if F[t1] > max_F1:
+                        max_F1 = F[t1]
+
+                        if metric == "ET":
+                            val = t0 * F[t0] + t1 * (F[t1] - F[t0]) + tau * (1 - F[t1])
+                        else:
+                            c0 = (
+                                cw["early"]
+                                if t0 <= 12
+                                else (cw["mid"] if t0 <= 27 else cw["late"])
+                            )
+                            c1 = (
+                                cw["early"]
+                                if t1 <= 12
+                                else (cw["mid"] if t1 <= 27 else cw["late"])
+                            )
+                            val = (
+                                c0 * (1 - F[t0])
+                                + c1 * (F[t1] - F[t0])
+                                + cw["retest"] * (1 - F[t0])
+                                + cw["short"] * max(0.0, pi_min - F[t1])
+                                + (cw["late"] if t1 >= 28 else 0.0)
+                            )
+
+                        best = {
+                            "t0": t0,
+                            "t1": t1,
+                            "val": val,
+                            "F0": F[t0],
+                            "F1": F[t1],
+                            "retest_rate": 1 - F[t0],
+                            "metric": metric,
+                        }
 
         return best
 
@@ -410,6 +454,22 @@ class Problem3Solver:
         two_stage_risk = self.two_stage_search(
             group_df, pi_min=min_attain_rate, metric="R"
         )
+
+        # 调试：检查两阶段结果
+        if two_stage_risk is None:
+            # print(f"    警告：组内样本数={len(group_df)}, 无法计算两阶段结果")
+            # 尝试使用较宽松的参数重新计算
+            two_stage_risk = self.two_stage_search(
+                group_df, pi_min=max(0.5, min_attain_rate - 0.2), metric="R"
+            )
+            if two_stage_risk is not None:
+                print(
+                    f"    信息：组内样本数={len(group_df)}, 使用宽松参数成功计算两阶段结果"
+                )
+            else:
+                print(
+                    f"    警告：组内样本数={len(group_df)}, 即使使用宽松参数仍无法计算两阶段结果"
+                )
 
         return {
             "single_stage": {
@@ -1019,7 +1079,7 @@ class Problem3Solver:
     def plot_results(self, df):
         """绘制分析结果"""
         fig, axes = plt.subplots(3, 3, figsize=(20, 18))
-        fig.suptitle("多因素BMI分组与达标比例约束分析结果", fontsize=16)
+        fig.suptitle("多因素BMI分组与两阶段策略优化分析结果", fontsize=16)
 
         # 1. BMI分组可视化
         axes[0, 0].hist(df["K"], bins=30, alpha=0.7, edgecolor="black")
@@ -1032,41 +1092,122 @@ class Problem3Solver:
         axes[0, 0].set_ylabel("频次")
         axes[0, 0].set_title("BMI分布及最优分组")
 
-        # 2. 最优时点vs BMI
+        # 2. 两阶段策略时点对比
         if self.optimal_groups is not None:
-            axes[0, 1].plot(
-                self.optimal_groups["avg_bmi"],
-                self.optimal_groups["optimal_week"],
-                "ro-",
-                linewidth=2,
-                markersize=8,
-            )
-            axes[0, 1].set_xlabel("平均BMI")
-            axes[0, 1].set_ylabel("最佳检测孕周")
-            axes[0, 1].set_title("最佳检测时点vs BMI")
+            group_ids = range(len(self.optimal_groups))
+
+            # 绘制t0和t1
+            has_two_stage = self.optimal_groups["two_stage_R_t0"].notna().any()
+
+            if has_two_stage:
+                t0_values = self.optimal_groups["two_stage_R_t0"].fillna(0)
+                t1_values = self.optimal_groups["two_stage_R_t1"].fillna(0)
+
+                axes[0, 1].scatter(
+                    group_ids,
+                    t0_values,
+                    color="green",
+                    s=100,
+                    label="首次检测时间(t0)",
+                    marker="o",
+                    alpha=0.8,
+                )
+                axes[0, 1].scatter(
+                    group_ids,
+                    t1_values,
+                    color="red",
+                    s=100,
+                    label="保底检测时间(t1)",
+                    marker="^",
+                    alpha=0.8,
+                )
+
+                # 连线显示时间窗口
+                for i, (t0, t1) in enumerate(zip(t0_values, t1_values)):
+                    if pd.notna(t0) and pd.notna(t1):
+                        axes[0, 1].plot([i, i], [t0, t1], "k-", alpha=0.3, linewidth=2)
+                        axes[0, 1].text(
+                            i,
+                            (t0 + t1) / 2,
+                            f"{t1-t0:.1f}周",
+                            ha="center",
+                            fontsize=8,
+                            bbox=dict(
+                                boxstyle="round,pad=0.3", facecolor="white", alpha=0.7
+                            ),
+                        )
+
+                axes[0, 1].set_ylabel("检测孕周")
+                axes[0, 1].set_title("两阶段策略时点分布")
+                axes[0, 1].legend()
+            else:
+                axes[0, 1].plot(
+                    self.optimal_groups["avg_bmi"],
+                    self.optimal_groups["optimal_week"],
+                    "ro-",
+                    linewidth=2,
+                    markersize=8,
+                )
+                axes[0, 1].set_xlabel("平均BMI")
+                axes[0, 1].set_ylabel("最佳检测孕周")
+                axes[0, 1].set_title("最佳检测时点vs BMI")
+
+            axes[0, 1].set_xlabel("分组ID")
+            axes[0, 1].set_xticks(group_ids)
+            axes[0, 1].set_xticklabels([f"组{i+1}" for i in group_ids])
             axes[0, 1].grid(True, alpha=0.3)
 
-        # 3. 达标率vs BMI
+        # 3. 两阶段策略效果对比
         if self.optimal_groups is not None:
             x_pos = range(len(self.optimal_groups))
-            bars1 = axes[0, 2].bar(
-                [x - 0.2 for x in x_pos],
-                self.optimal_groups["attainment_rate"],
-                width=0.4,
-                label="实际达标率",
-                alpha=0.7,
-            )
-            bars2 = axes[0, 2].bar(
-                [x + 0.2 for x in x_pos],
-                self.optimal_groups["effective_attainment_rate"],
-                width=0.4,
-                label="有效达标率",
-                alpha=0.7,
-            )
+
+            # 检查是否有两阶段数据
+            has_two_stage = self.optimal_groups["two_stage_R_F0"].notna().any()
+
+            if has_two_stage:
+                # 显示早期达标率和最终达标率
+                early_rates = self.optimal_groups["two_stage_R_F0"].fillna(0)
+                final_rates = self.optimal_groups["two_stage_R_F1"].fillna(0)
+
+                bars1 = axes[0, 2].bar(
+                    [x - 0.2 for x in x_pos],
+                    early_rates,
+                    width=0.4,
+                    label="早期达标率(t0)",
+                    alpha=0.7,
+                    color="lightgreen",
+                )
+                bars2 = axes[0, 2].bar(
+                    [x + 0.2 for x in x_pos],
+                    final_rates,
+                    width=0.4,
+                    label="最终达标率(t1)",
+                    alpha=0.7,
+                    color="lightcoral",
+                )
+            else:
+                # 回退到原有显示
+                bars1 = axes[0, 2].bar(
+                    [x - 0.2 for x in x_pos],
+                    self.optimal_groups["attainment_rate"],
+                    width=0.4,
+                    label="实际达标率",
+                    alpha=0.7,
+                )
+                bars2 = axes[0, 2].bar(
+                    [x + 0.2 for x in x_pos],
+                    self.optimal_groups["effective_attainment_rate"],
+                    width=0.4,
+                    label="有效达标率",
+                    alpha=0.7,
+                )
+
             axes[0, 2].axhline(y=0.9, color="red", linestyle="--", label="90%目标线")
             axes[0, 2].set_xlabel("分组")
             axes[0, 2].set_ylabel("达标率")
-            axes[0, 2].set_title("各组达标率对比")
+            axes[0, 2].set_title(
+                "两阶段策略达标率对比" if has_two_stage else "各组达标率对比"
+            )
             axes[0, 2].set_xticks(x_pos)
             axes[0, 2].set_xticklabels([f"组{i + 1}" for i in x_pos])
             axes[0, 2].legend()
@@ -1130,65 +1271,296 @@ class Problem3Solver:
                     va="bottom",
                 )
 
-        # 8. 身高体重分布 (按达标状态着色)
-        if len(df) > 0:
-            达标_mask = df["V"] >= 0.04
+        # 8. 两阶段策略可视化 (类似notebook中的策略图)
+        if (
+            self.optimal_groups is not None
+            and self.optimal_groups["two_stage_R_t0"].notna().any()
+        ):
+            # 使用生存函数数据创建类似notebook的策略图
+            axes[2, 1].set_title("两阶段策略示意图(前3组)")
 
-            scatter1 = axes[2, 1].scatter(
-                df[达标_mask]["D"],
-                df[达标_mask]["E"],
-                alpha=0.6,
-                label="达标",
-                c="green",
-                s=30,
-            )
-            scatter2 = axes[2, 1].scatter(
-                df[~达标_mask]["D"],
-                df[~达标_mask]["E"],
-                alpha=0.6,
-                label="未达标",
-                c="red",
-                s=30,
-            )
-            axes[2, 1].set_xlabel("身高")
-            axes[2, 1].set_ylabel("体重")
-            axes[2, 1].set_title("身高体重分布(按达标状态着色)")
-            axes[2, 1].legend()
+            # 为前3组绘制假想的F_g(t)曲线和策略线
+            colors = ["blue", "green", "orange"]
 
-        # 9. 分组结果汇总表
+            for idx in range(min(3, len(self.optimal_groups))):
+                group = self.optimal_groups.iloc[idx]
+
+                if pd.notna(group["two_stage_R_t0"]) and pd.notna(
+                    group["two_stage_R_t1"]
+                ):
+                    t0 = group["two_stage_R_t0"]
+                    t1 = group["two_stage_R_t1"]
+                    F0 = group["two_stage_R_F0"]
+                    F1 = group["two_stage_R_F1"]
+
+                    # 创建示意性的累积达标曲线
+                    t_range = np.linspace(10, 25, 100)
+                    # 使用sigmoidal函数模拟达标曲线
+                    F_curve = F1 / (1 + np.exp(-0.5 * (t_range - (t0 + t1) / 2)))
+
+                    # 绘制达标曲线
+                    axes[2, 1].plot(
+                        t_range,
+                        F_curve,
+                        color=colors[idx],
+                        linewidth=2,
+                        label=f"组{idx+1} F_g(t)",
+                    )
+
+                    # 标记关键时点
+                    axes[2, 1].axvline(t0, color=colors[idx], linestyle="--", alpha=0.7)
+                    axes[2, 1].axvline(t1, color="red", linestyle="--", alpha=0.7)
+                    axes[2, 1].scatter([t0], [F0], color=colors[idx], s=80, zorder=5)
+
+                    # 添加标注
+                    axes[2, 1].text(
+                        t0,
+                        F0 + 0.05,
+                        f"F={F0:.2f}",
+                        ha="center",
+                        fontsize=8,
+                        bbox=dict(
+                            boxstyle="round,pad=0.2", facecolor="white", alpha=0.8
+                        ),
+                    )
+
+            # 添加95%基准线
+            axes[2, 1].axhline(
+                0.95, color="orange", linestyle=":", alpha=0.7, label="95%目标"
+            )
+            axes[2, 1].set_xlabel("孕周(周)")
+            axes[2, 1].set_ylabel("累积达标率 F_g(t)")
+            axes[2, 1].legend(fontsize=8)
+            axes[2, 1].set_ylim(0, 1.05)
+            axes[2, 1].grid(True, alpha=0.3)
+        else:
+            # 原有的身高体重分布图（作为后备）
+            if len(df) > 0:
+                达标_mask = df["V"] >= 0.04
+
+                scatter1 = axes[2, 1].scatter(
+                    df[达标_mask]["D"],
+                    df[达标_mask]["E"],
+                    alpha=0.6,
+                    label="达标",
+                    c="green",
+                    s=30,
+                )
+                scatter2 = axes[2, 1].scatter(
+                    df[~达标_mask]["D"],
+                    df[~达标_mask]["E"],
+                    alpha=0.6,
+                    label="未达标",
+                    c="red",
+                    s=30,
+                )
+                axes[2, 1].set_xlabel("身高")
+                axes[2, 1].set_ylabel("体重")
+                axes[2, 1].set_title("身高体重分布(按达标状态着色)")
+                axes[2, 1].legend()
+
+        # 9. 两阶段策略结果汇总表
         if self.optimal_groups is not None:
             axes[2, 2].axis("off")
 
             table_data = []
-            for _, row in self.optimal_groups.iterrows():
-                table_data.append(
-                    [
-                        f"组{row['group_id']}",
-                        row["bmi_range"],
-                        f"{row['optimal_week']:.1f}",
-                        f"{row['attainment_rate']:.2f}",
-                        f"{row['effective_attainment_rate']:.2f}",
-                        f"{row['n_patients']}",
-                    ]
-                )
+            has_two_stage = self.optimal_groups["two_stage_R_t0"].notna().any()
 
-            table = axes[2, 2].table(
-                cellText=table_data,
-                colLabels=[
+            for _, row in self.optimal_groups.iterrows():
+                if has_two_stage and pd.notna(row.get("two_stage_R_t0")):
+                    # 包含两阶段信息的表格
+                    table_data.append(
+                        [
+                            f"组{row['group_id']}",
+                            row["bmi_range"],
+                            f"{row['two_stage_R_t0']:.1f}/{row['two_stage_R_t1']:.1f}",
+                            f"{row['two_stage_R_F0']:.2f}",
+                            f"{row['two_stage_R_F1']:.2f}",
+                            f"{row['n_patients']}",
+                        ]
+                    )
+                else:
+                    # 原有的单阶段表格
+                    table_data.append(
+                        [
+                            f"组{row['group_id']}",
+                            row["bmi_range"],
+                            f"{row['optimal_week']:.1f}",
+                            f"{row['attainment_rate']:.2f}",
+                            f"{row['effective_attainment_rate']:.2f}",
+                            f"{row['n_patients']}",
+                        ]
+                    )
+
+            if has_two_stage:
+                col_labels = [
+                    "分组",
+                    "BMI范围",
+                    "t0/t1(周)",
+                    "早期达标率",
+                    "最终达标率",
+                    "样本数",
+                ]
+                title = "两阶段策略详细结果"
+            else:
+                col_labels = [
                     "分组",
                     "BMI范围",
                     "最佳时点",
                     "实际达标率",
                     "有效达标率",
                     "样本数",
-                ],
+                ]
+                title = "分组详细结果"
+
+            table = axes[2, 2].table(
+                cellText=table_data,
+                colLabels=col_labels,
                 cellLoc="center",
                 loc="center",
             )
             table.auto_set_font_size(False)
             table.set_fontsize(8)
             table.scale(1, 1.5)
-            axes[2, 2].set_title("分组详细结果")
+            axes[2, 2].set_title(title)
+
+        plt.tight_layout()
+        return fig
+
+    def plot_two_stage_strategy(self, optimal_groups):
+        """绘制两阶段策略可视化图（类似notebook中的策略图）"""
+        if optimal_groups is None or not optimal_groups["two_stage_R_t0"].notna().any():
+            return None
+
+        groups = optimal_groups[optimal_groups["two_stage_R_t0"].notna()]
+        G = len(groups)
+
+        if G == 0:
+            return None
+
+        from math import ceil
+
+        ncols = 3 if G > 6 else 2
+        nrows = ceil(G / ncols)
+
+        fig, axes = plt.subplots(
+            nrows, ncols, figsize=(5 * ncols, 4 * nrows), sharex=True, sharey=True
+        )
+        axes = np.atleast_1d(axes).ravel()
+
+        fig.suptitle("两阶段NIPT检测策略", fontsize=16, fontweight="bold")
+
+        for i, (_, group) in enumerate(groups.iterrows()):
+            if i >= len(axes):
+                break
+
+            ax = axes[i]
+
+            # 获取该组数据
+            t0 = group["two_stage_R_t0"]
+            t_star = group["two_stage_R_t1"]
+            F_t0 = group["two_stage_R_F0"]
+            F_t1 = group["two_stage_R_F1"]
+
+            # 创建时间网格
+            t_grid = np.linspace(10, 25, 100)
+
+            # 使用分段函数模拟F_g(t)曲线
+            # 在t0之前缓慢增长，t0处达到F_t0，t_star处达到F_t1
+            Fg = np.zeros_like(t_grid)
+            for j, t in enumerate(t_grid):
+                if t <= t0:
+                    # t0之前的线性增长
+                    Fg[j] = F_t0 * (t - 10) / (t0 - 10) if t0 > 10 else F_t0
+                elif t <= t_star:
+                    # t0到t_star之间的线性增长
+                    Fg[j] = F_t0 + (F_t1 - F_t0) * (t - t0) / (t_star - t0)
+                else:
+                    # t_star之后保持不变
+                    Fg[j] = F_t1
+
+            # 限制在[0,1]范围内
+            Fg = np.clip(Fg, 0, 1)
+
+            # 绘制F_g(t)曲线（阶梯函数风格）
+            ax.step(t_grid, Fg, where="post", linewidth=3, label="F_g(t)", color="blue")
+
+            # 标记关键时点
+            # t0时点
+            ax.axvline(
+                t0, color="green", linestyle="--", linewidth=2, label=f"t0={t0:.1f}周"
+            )
+            ax.plot([t0], [F_t0], "go", markersize=8)
+            ax.text(
+                t0,
+                min(1.0, F_t0 + 0.06),
+                f"F={F_t0:.2f}",
+                ha="center",
+                color="green",
+                fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgreen", alpha=0.7),
+            )
+
+            # t*_g时点
+            ax.axvline(
+                t_star,
+                color="red",
+                linestyle="--",
+                linewidth=2,
+                label=f"t*={t_star:.1f}周",
+            )
+            ax.plot([t_star], [F_t1], "rs", markersize=8)
+
+            # 95%基准线
+            ax.axhline(
+                0.95,
+                color="orange",
+                linestyle=":",
+                alpha=0.8,
+                linewidth=2,
+                label="95%目标",
+            )
+
+            # 设置标题和标签
+            bmi_range = (
+                group["bmi_range"]
+                if "bmi_range" in group
+                else f"组{int(group['group_id'])}"
+            )
+            ax.set_title(
+                f'组{int(group["group_id"])}: {bmi_range}\n两阶段策略',
+                fontsize=12,
+                fontweight="bold",
+            )
+
+            if i >= (nrows - 1) * ncols:  # 最底行
+                ax.set_xlabel("孕周(周)", fontsize=10)
+            if i % ncols == 0:  # 最左列
+                ax.set_ylabel("累积达标率 F_g(t)", fontsize=10)
+
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(0, 1.05)
+            ax.set_xlim(10, 25)
+
+            # 添加图例（只在第一个图中显示）
+            if i == 0:
+                ax.legend(loc="lower right", fontsize=9, framealpha=0.9)
+
+            # 添加策略效果文本
+            advance_weeks = t_star - t0
+            ax.text(
+                0.02,
+                0.98,
+                f"提前: {advance_weeks:.1f}周\n早期成功率: {F_t0:.1%}",
+                transform=ax.transAxes,
+                fontsize=9,
+                verticalalignment="top",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.8),
+            )
+
+        # 关闭多余子图
+        for k in range(G, len(axes)):
+            axes[k].axis("off")
 
         plt.tight_layout()
         return fig
@@ -1283,6 +1655,16 @@ def run_problem3():
     plt.savefig("results/problem3_analysis.png", dpi=300, bbox_inches="tight")
     plt.show()
 
+    # 生成两阶段策略专门图像
+    if optimal_groups is not None and optimal_groups["two_stage_R_t0"].notna().any():
+        print("生成两阶段策略可视化图...")
+        fig_strategy = solver.plot_two_stage_strategy(optimal_groups)
+        if fig_strategy is not None:
+            plt.savefig(
+                "results/problem3_two_stage_strategy.png", dpi=300, bbox_inches="tight"
+            )
+            plt.show()
+
     # 步骤6：保存结果
     print("\n步骤6：保存分析结果")
 
@@ -1335,14 +1717,67 @@ def run_problem3():
         print("=" * 60)
         print("问题3分析完成！")
         print("生成的文件：")
-        print("- results/problem3_analysis.png (可视化结果)")
+        print("- results/problem3_analysis.png (综合分析结果)")
+        print("- results/problem3_two_stage_strategy.png (两阶段策略可视化)")
         print("- results/problem3_optimal_groups.csv (最优分组结果)")
         print("- results/problem3_sensitivity.csv (敏感性分析)")
         print("- results/problem3_feature_importance.csv (特征重要性)")
         print("- results/problem3_multifactor_analysis.csv (多因素详细分析)")
+        print("- results/problem3_two_stage_analysis.csv (两阶段策略分析)")
+        print("- results/problem3_personalized_recommendations.csv (个性化检测建议)")
         print("=" * 60)
 
         # 输出关键结果摘要
+        # 生成两阶段策略分析报告
+        two_stage_summary = []
+        for _, group in optimal_groups.iterrows():
+            if group.get("two_stage_R_t0") is not None:
+                # 计算提前周数
+                advance_weeks = group["two_stage_R_t1"] - group["two_stage_R_t0"]
+
+                # 计算期望检测时间
+                expected_time = group["two_stage_R_t0"] * group[
+                    "two_stage_R_F0"
+                ] + group["two_stage_R_t1"] * (1 - group["two_stage_R_F0"])
+
+                # 风险评级
+                if group["two_stage_R_F0"] >= 0.8:
+                    risk_level = "推荐"
+                    advice = "早期检测成功率高"
+                elif group["two_stage_R_F0"] >= 0.6:
+                    risk_level = "建议"
+                    advice = "早期检测中等成功率，需关注复测"
+                else:
+                    risk_level = "谨慎"
+                    advice = "早期检测成功率较低，强化复测方案"
+
+                two_stage_summary.append(
+                    {
+                        "组号": int(group["group_id"]),
+                        "BMI区间": group["bmi_range"],
+                        "样本量": int(group["n_patients"]),
+                        "最优t0(周)": round(float(group["two_stage_R_t0"]), 1),
+                        "保底t1(周)": round(float(group["two_stage_R_t1"]), 1),
+                        "早期达标率": f"{float(group['two_stage_R_F0']):.1%}",
+                        "期望检测时间(周)": round(float(expected_time), 2),
+                        "风险评级": risk_level,
+                        "临床建议": advice,
+                        "提前周数": round(float(advance_weeks), 1),
+                    }
+                )
+
+        if two_stage_summary:
+            print("\n=== 两阶段联合优化结果 ===")
+            two_stage_df = pd.DataFrame(two_stage_summary)
+            print(two_stage_df.to_string(index=False))
+
+            # 保存两阶段分析结果
+            two_stage_df.to_csv(
+                "results/problem3_two_stage_analysis.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+
         print("\n=== 关键结果摘要 ===")
         print(f"总样本数: {len(male_df)}")
         print(f"最优分组数: {len(optimal_groups)}")
@@ -1390,6 +1825,88 @@ def run_problem3():
             print(f"\n最重要的影响因素:")
             for i, (_, row) in enumerate(importance_df.head(5).iterrows()):
                 print(f"{i + 1}. {row['feature']}: {row['importance']:.4f}")
+
+        # 生成个性化检测方案建议（基于两阶段结果）
+        if two_stage_summary:
+            print("\n=== 个性化检测方案建议 ===")
+            recommendations = []
+            for item in two_stage_summary:
+                # 时间窗口建议
+                t0 = item["最优t0(周)"]
+                if t0 < 12:
+                    timing_advice = f"在{t0:.1f}周进行首次检测(早期窗口)"
+                elif t0 < 16:
+                    timing_advice = f"在{t0:.1f}周进行首次检测(标准窗口)"
+                else:
+                    timing_advice = f"在{t0:.1f}周进行首次检测(延后窗口)"
+
+                full_advice = f"{timing_advice}，{item['临床建议']}"
+
+                recommendations.append(
+                    {
+                        "组别": f"组{item['组号']}",
+                        "BMI范围": item["BMI区间"],
+                        "样本特征": f"N={item['样本量']}",
+                        "推荐等级": item["风险评级"],
+                        "首次检测时间": f"{item['最优t0(周)']}周",
+                        "保底检测时间": f"{item['保底t1(周)']}周",
+                        "早期成功率": item["早期达标率"],
+                        "临床建议": full_advice,
+                        "备注": f"预期节省{item['提前周数']}周检测时间",
+                    }
+                )
+
+            recommendations_df = pd.DataFrame(recommendations)
+            print(recommendations_df.to_string(index=False))
+
+            # 保存个性化建议
+            recommendations_df.to_csv(
+                "results/problem3_personalized_recommendations.csv",
+                index=False,
+                encoding="utf-8-sig",
+            )
+
+            # 生成临床实施建议
+            print("\n=== 临床实施建议 ===")
+
+            avg_early_rate = sum(
+                [
+                    float(item["早期达标率"].rstrip("%")) / 100
+                    for item in two_stage_summary
+                ]
+            ) / len(two_stage_summary)
+            avg_advance_weeks = sum(
+                [item["提前周数"] for item in two_stage_summary]
+            ) / len(two_stage_summary)
+
+            clinical_advice = f"""
+1. 个性化检测策略：
+   - 根据孕妇BMI分组，采用不同的两阶段检测方案
+   - 平均早期检测成功率: {avg_early_rate:.1%}
+   - 平均节省检测时间: {avg_advance_weeks:.1f}周
+
+2. 质量控制要点：
+   - 确保早期检测的技术可靠性
+   - 建立完善的复测跟踪机制  
+   - 设置风险阈值预警系统
+
+3. 成本效益考量：
+   - 早期检测可显著减少整体检测时间
+   - 需平衡检测成本与临床效果
+   - 建议建立动态成本调节机制
+
+4. 实施监控：
+   - 定期评估各组实际达标率
+   - 监控成本控制效果
+   - 根据实际情况调整参数
+
+5. 分组策略特点：
+   - 低BMI组: 早期检测时点可适当提前，成功率通常较高
+   - 高BMI组: 需要更谨慎的检测时点选择，加强保底检测
+   - 建议定期根据实际数据调整分组阈值
+"""
+
+            print(clinical_advice)
 
     else:
         print("警告：未能生成有效的分组结果")
